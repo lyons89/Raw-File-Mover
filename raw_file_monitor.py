@@ -1,21 +1,21 @@
 # RAW File Monitor with MAP Grouping
-import os
-import time
-import threading
-import shutil
-import re
 import json
 import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
+import os
+import re
+import shutil
+import threading
+import time
 import tkinter as tk
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from tkinter import filedialog, scrolledtext
-import pystray
 from PIL import Image, ImageDraw
 
 CHECK_INTERVAL = 30
 SETTINGS_FILE = "monitor_settings.json"
 LOG_FILE = "raw_file_monitor.log"
+TRANSFER_DB = "transferred_files.json"
 AGE_THRESHOLD = timedelta(hours=12)
 
 
@@ -47,6 +47,7 @@ class FileMonitor:
         self.log = log_callback
         self.running = False
         self._notified = set()
+        self.transferred_files = self.load_transferred_files()
 
     def extract_sample_id(self, filename):
 
@@ -160,7 +161,12 @@ class FileMonitor:
             fname = os.path.basename(rel_path)
             if not self.pattern.match(fname):
                 continue
+            if self.already_transferred(fname):
+                continue
+            
             if fname.lower() in dest_files:
+                self.transferred_files.add(fname.lower())
+                self.save_transferred_files()
                 continue
             try:
                 st = os.stat(abs_path)
@@ -169,6 +175,7 @@ class FileMonitor:
             age = now - datetime.fromtimestamp(st.st_mtime)
             if age >= AGE_THRESHOLD or (age >= self.idle_time and st.st_size >= self.min_size_bytes):
                 self.copy_with_retry(rel_path)
+
 
     def copy_with_retry(self, rel_path):
         for attempt in range(3):
@@ -197,17 +204,53 @@ class FileMonitor:
         os.makedirs(dest_folder, exist_ok=True)
         dst = os.path.join(dest_folder, filename)
         if os.path.exists(dst):
-            return True
+            self.transferred_files.add(
+                filename.lower()
+            )
+
+            self.save_transferred_files()
+
+            return True        
         try:
             self.log(f'Copying: {filename} -> {dest_folder}')
             shutil.copy2(src, dst)
             if os.path.getsize(src) == os.path.getsize(dst):
                 self.log(f'✅ Verified: {filename}')
-                return True
+
+                self.transferred_files.add(
+                    filename.lower()
+                )
+                self.save_transferred_files()
+                return True            
             return False
         except Exception as e:
             self.log(f'Error copying {filename}: {e}')
             return False
+
+    def load_transferred_files(self):
+        if not os.path.exists(TRANSFER_DB):
+            return set()
+
+        try:
+            with open(TRANSFER_DB, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception as e:
+            self.log(f"Error loading transfer database: {e}")
+            return set()
+    
+    def save_transferred_files(self):
+        try:
+            with open(TRANSFER_DB, "w", encoding="utf-8") as f:
+                json.dump(
+                    sorted(self.transferred_files),
+                    f,
+                    indent=2
+                )
+        except Exception as e:
+            self.log(f"Error saving transfer database: {e}")
+    
+    def already_transferred(self, filename):
+        return filename.lower() in self.transferred_files
 
 
 class App:
