@@ -1,4 +1,5 @@
 # RAW File Monitor with MAP Grouping – Multi-Tab Edition
+# Patched: DST/clock-change-proof completion detection + resilient logging
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ SETTINGS_FILE = "monitor_settings.json"
 LOG_FILE = "raw_file_monitor.log"
 TRANSFER_DB = "transferred_files.json"
 AGE_THRESHOLD = timedelta(hours=12)
+HEARTBEAT_EVERY_N_CYCLES = max(1, int(600 / CHECK_INTERVAL))  # ~every 10 minutes
 
 # Shared lock so concurrent monitors don't race on the transfer DB
 _transfer_db_lock = threading.Lock()
@@ -24,13 +26,39 @@ _transfer_db_lock = threading.Lock()
 # ─────────────────────────────────────────────────────────────────────────────
 # Logger
 # ─────────────────────────────────────────────────────────────────────────────
+class ResilientRotatingFileHandler(RotatingFileHandler):
+    """A RotatingFileHandler that tries to recover instead of silently going
+    dark forever. If a write fails (locked file, disconnected network drive,
+    disk hiccup, a failed rollover because another process has the log open,
+    etc.), it closes the stream and reopens a fresh handle, then retries once.
+    If that also fails, it reports to stderr but still does not raise, so a
+    logging failure can never take down the caller."""
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except Exception:
+            try:
+                self.close()
+                self.stream = self._open()
+                super().emit(record)
+            except Exception:
+                import sys
+                import traceback
+
+                try:
+                    traceback.print_exc(file=sys.stderr)
+                except Exception:
+                    pass
+
+
 def build_logger(log_file: str = LOG_FILE) -> logging.Logger:
     logger = logging.getLogger("raw_file_monitor")
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(
+    fh = ResilientRotatingFileHandler(
         log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     fh.setFormatter(fmt)
@@ -43,7 +71,7 @@ def build_logger(log_file: str = LOG_FILE) -> logging.Logger:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FileMonitor  (core logic – unchanged from original)
+# FileMonitor
 # ─────────────────────────────────────────────────────────────────────────────
 class FileMonitor:
     def __init__(
@@ -68,6 +96,11 @@ class FileMonitor:
         self.running = False
         self._notified = set()
         self.transferred_files = self._load_transferred_files()
+
+        # Per-file poll history used to detect "stable/idle" without ever
+        # subtracting wall-clock datetimes (immune to DST, NTP corrections,
+        # manual clock changes, etc.). Keyed by rel_path.
+        self._poll_history = {}
 
     # ── ID helpers ───────────────────────────────────────────────────────────
 
@@ -102,19 +135,47 @@ class FileMonitor:
 
     def start(self):
         self.running = True
-        threading.Thread(target=self._monitor_loop, daemon=True).start()
-        self.log("Monitoring started…")
+        threading.Thread(target=self._run_supervised, daemon=True).start()
+        self._safe_log("Monitoring started…")
 
     def stop(self):
         self.running = False
-        self.log("Monitoring stopped.")
+        self._safe_log("Monitoring stopped.")
+
+    def _safe_log(self, msg: str):
+        """Never let a logging/UI failure take down the monitor thread."""
+        try:
+            self.log(msg)
+        except Exception:
+            pass
+
+    def _run_supervised(self):
+        """Supervisor: if _monitor_loop ever dies from an unexpected
+        exception, log it and restart instead of silently stopping forever."""
+        while self.running:
+            try:
+                self._monitor_loop()
+            except Exception as exc:
+                self._safe_log(
+                    f"Monitor loop crashed unexpectedly ({exc!r}) — restarting in 10s"
+                )
+                time.sleep(10)
+        self._safe_log("Monitor loop exiting (stopped).")
 
     def _monitor_loop(self):
+        cycle = 0
         while self.running:
             try:
                 self._check_files()
             except Exception as exc:
-                self.log(f"Error: {exc}")
+                self._safe_log(f"Error: {exc}")
+            cycle += 1
+            if cycle % HEARTBEAT_EVERY_N_CYCLES == 0:
+                self._safe_log(
+                    f"\U0001f493 Heartbeat — monitor alive, "
+                    f"{len(self.transferred_files)} files transferred so far, "
+                    f"{len(self._poll_history)} file(s) currently being tracked"
+                )
             time.sleep(CHECK_INTERVAL)
 
     # ── File scanning ─────────────────────────────────────────────────────────
@@ -131,6 +192,12 @@ class FileMonitor:
                     yield os.path.relpath(abs_path, self.source), abs_path
 
     def _dest_listing(self):
+        """Set of lowercased filenames that already exist somewhere at the
+        destination. We deliberately do NOT compare sizes or touch these
+        files in any way — the monotonic-stability + lock checks below mean
+        nothing is ever transferred until it's actually finished writing, so
+        there's no need (and no desire) to second-guess or modify files that
+        are already at the destination."""
         dest_files = set()
         if os.path.exists(self.dest):
             for root, _, files in os.walk(self.dest):
@@ -138,28 +205,91 @@ class FileMonitor:
                     dest_files.add(f.lower())
         return dest_files
 
+    @staticmethod
+    def _file_is_locked(abs_path) -> bool:
+        """Best-effort "is something else still writing this file" check.
+        On Windows this is reliable for Thermo/Xcalibur RAW files, which are
+        held open exclusively while acquiring — a failed open means the
+        instrument software hasn't released the file yet. On POSIX this is
+        mostly a no-op (open rarely fails just because another process has
+        the file open), so treat it as a bonus signal, not the only one."""
+        try:
+            with open(abs_path, "ab"):
+                pass
+            return False
+        except (PermissionError, OSError):
+            return True
+
     def _check_files(self):
-        now = datetime.now()
+        now_mono = time.monotonic()
+        now_wall = datetime.now()
         dest_files = self._dest_listing()
+        seen_this_round = set()
+
         for rel_path, abs_path in self._iter_source_files():
+            seen_this_round.add(rel_path)
             fname = os.path.basename(rel_path)
             if not self.pattern.match(fname):
                 continue
             if self._already_transferred(fname):
                 continue
-            if fname.lower() in dest_files:
-                self.transferred_files.add(fname.lower())
-                self._save_transferred_files()
-                continue
+
             try:
                 st = os.stat(abs_path)
             except FileNotFoundError:
                 continue
-            age = now - datetime.fromtimestamp(st.st_mtime)
-            if age >= AGE_THRESHOLD or (
-                age >= self.idle_time and st.st_size >= self.min_size_bytes
+
+            if fname.lower() in dest_files:
+                # A file with this name already exists at the destination.
+                # We don't inspect or touch it in any way — just trust it
+                # and move on, exactly as the original script did. The
+                # DST/idle-detection fix below is what actually prevents a
+                # bad copy from landing there in the first place.
+                self.transferred_files.add(fname.lower())
+                self._save_transferred_files()
+                continue
+
+            prev = self._poll_history.get(rel_path)
+            if (
+                prev is None
+                or prev["size"] != st.st_size
+                or prev["mtime"] != st.st_mtime
             ):
+                # First time seen, or it changed since last poll -> the
+                # stability clock resets. This never compares two different
+                # wall-clock readings, so DST/clock jumps can't fool it.
+                self._poll_history[rel_path] = {
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "since_monotonic": now_mono,
+                }
+                continue
+
+            stable_for = timedelta(seconds=now_mono - prev["since_monotonic"])
+
+            # A generous wall-clock fallback for files that were already
+            # sitting untouched before this app session even started (so a
+            # restart doesn't force every old file to wait a fresh idle
+            # period). The 12h buffer absorbs any DST-type skew harmlessly.
+            wall_age = now_wall - datetime.fromtimestamp(st.st_mtime)
+            looks_forced = wall_age >= AGE_THRESHOLD
+
+            looks_idle = (
+                stable_for >= self.idle_time and st.st_size >= self.min_size_bytes
+            )
+
+            if looks_idle or looks_forced:
+                if self._file_is_locked(abs_path):
+                    self._safe_log(
+                        f"{fname} looks idle but is still open/locked — skipping this round"
+                    )
+                    continue
                 self._copy_with_retry(rel_path)
+
+        # Forget files that disappeared (already moved elsewhere, deleted, etc.)
+        for stale in list(self._poll_history):
+            if stale not in seen_this_round:
+                self._poll_history.pop(stale, None)
 
     # ── Copy helpers ──────────────────────────────────────────────────────────
 
@@ -167,17 +297,30 @@ class FileMonitor:
         for attempt in range(3):
             if self._copy_file(rel_path):
                 return
-            self.log(f"Retry {attempt + 1} for {rel_path}")
+            self._safe_log(f"Retry {attempt + 1} for {rel_path}")
             time.sleep(5)
 
     def _copy_file(self, rel_path):
         src = os.path.join(self.source, rel_path)
         filename = os.path.basename(rel_path)
 
+        # Final safety check right before we actually start copying: make
+        # sure nothing has touched or re-opened the file since we decided it
+        # was idle.
+        try:
+            pre_stat = os.stat(src)
+        except FileNotFoundError:
+            return False
+        if self._file_is_locked(src):
+            self._safe_log(
+                f"{filename} became locked again just before copying — skipping"
+            )
+            return False
+
         if self.organize_files:
             sample_id = self.extract_sample_id(filename)
             if not sample_id:
-                self.log(f"Could not locate project ID in {filename}")
+                self._safe_log(f"Could not locate project ID in {filename}")
                 return False
             dest_folder = self.build_destination_folder(sample_id)
         else:
@@ -186,22 +329,29 @@ class FileMonitor:
         os.makedirs(dest_folder, exist_ok=True)
         dst = os.path.join(dest_folder, filename)
 
-        if os.path.exists(dst):
-            self.transferred_files.add(filename.lower())
-            self._save_transferred_files()
-            return True
-
         try:
-            self.log(f"Copying: {filename} → {dest_folder}")
+            self._safe_log(f"Copying: {filename} → {dest_folder}")
+            # shutil.copy2 overwrites dst if it already exists (e.g. a
+            # partial leftover from a previous failed attempt), so there's
+            # never a need to delete anything ourselves — this script does
+            # not have (and does not need) permission to remove files.
             shutil.copy2(src, dst)
-            if os.path.getsize(src) == os.path.getsize(dst):
-                self.log(f"✅ Verified: {filename}")
+            src_size_after = os.path.getsize(src)
+            dst_size = os.path.getsize(dst)
+            if src_size_after == pre_stat.st_size == dst_size:
+                self._safe_log(f"\u2705 Verified: {filename}")
                 self.transferred_files.add(filename.lower())
                 self._save_transferred_files()
                 return True
+
+            self._safe_log(
+                f"Size mismatch copying {filename} "
+                f"(before={pre_stat.st_size}, source now={src_size_after}, dest={dst_size}) "
+                f"— file was still being written; will retry (next attempt overwrites in place)"
+            )
             return False
         except Exception as exc:
-            self.log(f"Error copying {filename}: {exc}")
+            self._safe_log(f"Error copying {filename}: {exc}")
             return False
 
     # ── Transfer DB ───────────────────────────────────────────────────────────
@@ -213,7 +363,7 @@ class FileMonitor:
             with open(TRANSFER_DB, "r", encoding="utf-8") as fh:
                 return set(json.load(fh))
         except Exception as exc:
-            self.log(f"Error loading transfer database: {exc}")
+            self._safe_log(f"Error loading transfer database: {exc}")
             return set()
 
     def _save_transferred_files(self):
@@ -229,7 +379,7 @@ class FileMonitor:
                 with open(TRANSFER_DB, "w", encoding="utf-8") as fh:
                     json.dump(sorted(self.transferred_files), fh, indent=2)
             except Exception as exc:
-                self.log(f"Error saving transfer database: {exc}")
+                self._safe_log(f"Error saving transfer database: {exc}")
 
     def _already_transferred(self, filename: str) -> bool:
         return filename.lower() in self.transferred_files
@@ -364,10 +514,27 @@ class MonitorTab:
             self.dst_entry.insert(0, path)
 
     def log(self, msg: str):
-        """Write to the shared rotating log file and this tab's log box."""
-        self.logger.info(msg)
-        self.log_box.insert(tk.END, msg + "\n")
-        self.log_box.see(tk.END)
+        """Write to the shared rotating log file (thread-safe) and this tab's
+        log box. The file write happens on whichever thread called this; the
+        Tkinter widget update is marshalled onto the main/UI thread via
+        `after()`, because Tkinter widgets must never be touched directly
+        from a background thread — doing so was a likely cause of the
+        monitor thread silently dying (and logging stopping) under load."""
+        try:
+            self.logger.info(msg)
+        except Exception:
+            pass
+        try:
+            self.frame.after(0, self._append_to_box, msg)
+        except Exception:
+            pass
+
+    def _append_to_box(self, msg: str):
+        try:
+            self.log_box.insert(tk.END, msg + "\n")
+            self.log_box.see(tk.END)
+        except Exception:
+            pass
 
     def _start(self):
         if self.monitor and self.monitor.running:
